@@ -1,0 +1,19 @@
+.env
+.venv
+
+# Virtual environment
+.venv/
+
+# Environment variables / secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated research data
+data/
+
+# IDE
+.vscode/
