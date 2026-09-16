@@ -16,8 +16,10 @@ from pathlib import Path
 
 import mlflow
 import torch
+from sklearn.metrics import average_precision_score
 from torch.utils.data import DataLoader, Subset
 
+from ldpfp.evaluate import fmax_score
 from ldpfp.models.hierarchical_classifier import (
     HierarchicalGOClassifier,
     hierarchical_loss,
@@ -194,12 +196,80 @@ def train(
     seed: int = 42,
     model_output_path: str | Path | None = None,
     split_output_path: str | Path | None = None,
+    patience: int = 5,
+    min_delta: float = 1e-4,
 ):
     """
     Train the hierarchical GO classifier.
 
+    Model selection is based on validation Fmax.
+
     The held-out test set is created here for reproducibility but is
     intentionally never loaded or evaluated during training.
+
+    Parameters
+    ----------
+    dataset:
+        ProteinLiteratureDataset containing variable-length PMID
+        embedding sets and propagated GO labels.
+
+    parent_child_pairs:
+        List of (child_idx, parent_idx) GO hierarchy relationships.
+
+    n_labels:
+        Number of GO terms in the propagated vocabulary.
+
+    embed_dim:
+        Dimension of PMID embeddings.
+
+    epochs:
+        Maximum number of training epochs.
+
+    batch_size:
+        Number of proteins per mini-batch.
+
+    lr:
+        AdamW learning rate.
+
+    lam:
+        Weight of the hierarchy-consistency penalty.
+
+    train_fraction:
+        Fraction of proteins assigned to training.
+
+    val_fraction:
+        Fraction assigned to validation.
+
+    test_fraction:
+        Fraction reserved for final Phase 7 evaluation.
+
+    device:
+        Training device. Automatically selected when None.
+
+    seed:
+        Random seed used for reproducibility.
+
+    model_output_path:
+        Path where the best checkpoint will be saved.
+
+    split_output_path:
+        Path where train/validation/test protein IDs are saved.
+
+    patience:
+        Number of consecutive epochs without meaningful validation
+        Fmax improvement before early stopping.
+
+    min_delta:
+        Minimum validation Fmax increase required to count as an
+        improvement.
+
+    Returns
+    -------
+    model:
+        Model containing the best validation-Fmax weights.
+
+    history:
+        Dictionary containing training and validation metrics.
     """
 
     # ---------------------------------------------------------
@@ -216,14 +286,8 @@ def train(
     device = torch.device(device)
 
     print(f"Device: {device}")
-    print(
-        f"Dataset proteins: "
-        f"{len(dataset):,}"
-    )
-    print(
-        f"GO labels: "
-        f"{n_labels:,}"
-    )
+    print(f"Dataset proteins: {len(dataset):,}")
+    print(f"GO labels: {n_labels:,}")
     print(
         f"Hierarchy pairs: "
         f"{len(parent_child_pairs):,}"
@@ -232,14 +296,24 @@ def train(
         f"Embedding dimension: "
         f"{embed_dim}"
     )
-    print(
-        f"Batch size: "
-        f"{batch_size}"
-    )
-    print(
-        f"Epochs: "
-        f"{epochs}"
-    )
+    print(f"Batch size: {batch_size}")
+    print(f"Epochs: {epochs}")
+    print(f"Patience: {patience}")
+    print(f"Min delta: {min_delta}")
+
+    # ---------------------------------------------------------
+    # Validation
+    # ---------------------------------------------------------
+
+    if patience < 1:
+        raise ValueError(
+            "patience must be at least 1."
+        )
+
+    if min_delta < 0:
+        raise ValueError(
+            "min_delta cannot be negative."
+        )
 
     # ---------------------------------------------------------
     # Reproducibility
@@ -305,6 +379,10 @@ def train(
 
     # ---------------------------------------------------------
     # DataLoaders
+    #
+    # Padding occurs dynamically within each mini-batch.
+    # The full dataset is never padded to the global maximum
+    # number of publications.
     # ---------------------------------------------------------
 
     train_loader = DataLoader(
@@ -327,10 +405,9 @@ def train(
         ),
     )
 
-    # Deliberately no test_loader here.
+    # Deliberately no test_loader.
     #
-    # The test split must remain untouched
-    # until Phase 7.
+    # The test split remains untouched until Phase 7.
 
     # ---------------------------------------------------------
     # Model
@@ -353,7 +430,18 @@ def train(
     history = {
         "train_loss": [],
         "val_loss": [],
+        "val_fmax": [],
+        "val_micro_aupr": [],
+        "val_best_threshold": [],
     }
+
+    best_val_fmax = -1.0
+    best_epoch = -1
+    best_threshold = None
+
+    epochs_without_improvement = 0
+
+    best_state_dict = None
 
     # ---------------------------------------------------------
     # MLflow
@@ -383,6 +471,10 @@ def train(
                 "n_train": n_train,
                 "n_val": n_val,
                 "n_test": n_test,
+                "patience": patience,
+                "min_delta": min_delta,
+                "selection_metric":
+                    "validation_fmax",
             }
         )
 
@@ -392,9 +484,9 @@ def train(
 
         for epoch in range(epochs):
 
-            # -------------------------------------------------
+            # =================================================
             # Training
-            # -------------------------------------------------
+            # =================================================
 
             model.train()
 
@@ -452,13 +544,16 @@ def train(
                 / n_train
             )
 
-            # -------------------------------------------------
+            # =================================================
             # Validation
-            # -------------------------------------------------
+            # =================================================
 
             model.eval()
 
             total_val_loss = 0.0
+
+            val_targets = []
+            val_probabilities = []
 
             with torch.no_grad():
 
@@ -501,106 +596,320 @@ def train(
                         * embeddings.size(0)
                     )
 
+                    probabilities = torch.sigmoid(
+                        logits
+                    )
+
+                    val_targets.append(
+                        targets.detach().cpu()
+                    )
+
+                    val_probabilities.append(
+                        probabilities.detach().cpu()
+                    )
+
             val_loss = (
                 total_val_loss
                 / n_val
             )
 
             # -------------------------------------------------
-            # Logging
+            # Combine validation batches
             # -------------------------------------------------
 
-            history[
-                "train_loss"
-            ].append(train_loss)
+            y_true = torch.cat(
+                val_targets,
+                dim=0,
+            ).numpy()
+
+            y_prob = torch.cat(
+                val_probabilities,
+                dim=0,
+            ).numpy()
+
+            # -------------------------------------------------
+            # Validation predictive metrics
+            # -------------------------------------------------
+
+            val_fmax, val_best_threshold = (
+                fmax_score(
+                    y_true,
+                    y_prob,
+                )
+            )
+
+            val_micro_aupr = (
+                average_precision_score(
+                    y_true,
+                    y_prob,
+                    average="micro",
+                )
+            )
+
+            # -------------------------------------------------
+            # History
+            # -------------------------------------------------
+
+            history["train_loss"].append(
+                float(train_loss)
+            )
+
+            history["val_loss"].append(
+                float(val_loss)
+            )
+
+            history["val_fmax"].append(
+                float(val_fmax)
+            )
+
+            history["val_micro_aupr"].append(
+                float(val_micro_aupr)
+            )
 
             history[
-                "val_loss"
-            ].append(val_loss)
+                "val_best_threshold"
+            ].append(
+                float(val_best_threshold)
+            )
+
+            # -------------------------------------------------
+            # MLflow logging
+            # -------------------------------------------------
 
             mlflow.log_metrics(
                 {
                     "train_loss":
-                        train_loss,
+                        float(train_loss),
+
                     "val_loss":
-                        val_loss,
+                        float(val_loss),
+
+                    "val_fmax":
+                        float(val_fmax),
+
+                    "val_micro_aupr":
+                        float(val_micro_aupr),
+
+                    "val_best_threshold":
+                        float(
+                            val_best_threshold
+                        ),
                 },
                 step=epoch,
             )
 
+            # -------------------------------------------------
+            # Epoch output
+            # -------------------------------------------------
+
             print(
-                f"Epoch "
-                f"{epoch + 1:02d}/{epochs} | "
-                f"train_loss="
-                f"{train_loss:.6f} | "
-                f"val_loss="
-                f"{val_loss:.6f}"
+                f"Epoch {epoch + 1:02d}/{epochs} | "
+                f"train_loss={train_loss:.6f} | "
+                f"val_loss={val_loss:.6f} | "
+                f"Fmax={val_fmax:.4f} | "
+                f"micro-AUPR={val_micro_aupr:.4f} | "
+                f"t*={val_best_threshold:.2f}"
             )
+
+            # =================================================
+            # Best-model checkpointing
+            # =================================================
+
+            improved = (
+                val_fmax
+                > best_val_fmax + min_delta
+            )
+
+            if improved:
+
+                best_val_fmax = float(
+                    val_fmax
+                )
+
+                best_epoch = epoch + 1
+
+                best_threshold = float(
+                    val_best_threshold
+                )
+
+                epochs_without_improvement = 0
+
+                # Keep an in-memory copy of the best weights.
+                #
+                # Moving tensors to CPU ensures this copy does
+                # not consume additional GPU memory.
+                best_state_dict = {
+                    key: value.detach().cpu().clone()
+                    for key, value
+                    in model.state_dict().items()
+                }
+
+                if model_output_path is not None:
+
+                    best_path = Path(
+                        model_output_path
+                    )
+
+                    best_path.parent.mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    )
+
+                    torch.save(
+                        {
+                            "model_state_dict":
+                                model.state_dict(),
+
+                            "optimizer_state_dict":
+                                optimizer.state_dict(),
+
+                            "n_labels":
+                                n_labels,
+
+                            "embed_dim":
+                                embed_dim,
+
+                            "parent_child_pairs":
+                                parent_child_pairs,
+
+                            "history":
+                                history,
+
+                            "seed":
+                                seed,
+
+                            "best_epoch":
+                                best_epoch,
+
+                            "best_val_fmax":
+                                best_val_fmax,
+
+                            "best_threshold":
+                                best_threshold,
+
+                            "train_fraction":
+                                train_fraction,
+
+                            "val_fraction":
+                                val_fraction,
+
+                            "test_fraction":
+                                test_fraction,
+                        },
+                        best_path,
+                    )
+
+                print(
+                    "  ↳ New best model saved "
+                    f"(Fmax={best_val_fmax:.4f})"
+                )
+
+            else:
+
+                epochs_without_improvement += 1
+
+                print(
+                    "  ↳ No Fmax improvement "
+                    f"({epochs_without_improvement}/"
+                    f"{patience})"
+                )
+
+            # =================================================
+            # Early stopping
+            # =================================================
+
+            if (
+                epochs_without_improvement
+                >= patience
+            ):
+
+                print()
+                print(
+                    "Early stopping triggered."
+                )
+
+                print(
+                    f"No validation Fmax improvement "
+                    f"greater than {min_delta} for "
+                    f"{patience} consecutive epochs."
+                )
+
+                break
+
+        # =====================================================
+        # Restore best model
+        # =====================================================
+
+        if best_state_dict is not None:
+
+            model.load_state_dict(
+                best_state_dict
+            )
+
+            model.to(device)
 
         # -----------------------------------------------------
-        # Save model checkpoint
+        # MLflow final metadata
         # -----------------------------------------------------
 
-        if model_output_path is not None:
+        mlflow.log_metrics(
+            {
+                "best_val_fmax":
+                    best_val_fmax,
 
-            model_output_path = Path(
-                model_output_path
-            )
+                "best_epoch":
+                    best_epoch,
 
-            model_output_path.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-            checkpoint = {
-                "model_state_dict":
-                    model.state_dict(),
-
-                "optimizer_state_dict":
-                    optimizer.state_dict(),
-
-                "n_labels":
-                    n_labels,
-
-                "embed_dim":
-                    embed_dim,
-
-                "parent_child_pairs":
-                    parent_child_pairs,
-
-                "history":
-                    history,
-
-                "seed":
-                    seed,
-
-                "train_fraction":
-                    train_fraction,
-
-                "val_fraction":
-                    val_fraction,
-
-                "test_fraction":
-                    test_fraction,
-
-                "n_train":
-                    n_train,
-
-                "n_val":
-                    n_val,
-
-                "n_test":
-                    n_test,
+                "best_threshold":
+                    (
+                        best_threshold
+                        if best_threshold is not None
+                        else 0.0
+                    ),
             }
+        )
 
-            torch.save(
-                checkpoint,
-                model_output_path,
-            )
+    # =========================================================
+    # Training summary
+    # =========================================================
 
-            print(
-                f"Model saved → "
-                f"{model_output_path}"
-            )
+    print()
+    print("=" * 60)
+    print("TRAINING COMPLETE")
+    print("=" * 60)
+
+    print(
+        f"Epochs completed:     "
+        f"{len(history['train_loss'])}"
+    )
+
+    print(
+        f"Best epoch:           "
+        f"{best_epoch}"
+    )
+
+    print(
+        f"Best validation Fmax: "
+        f"{best_val_fmax:.6f}"
+    )
+
+    if best_threshold is not None:
+        print(
+            f"Best threshold:       "
+            f"{best_threshold:.2f}"
+        )
+
+    if model_output_path is not None:
+        print(
+            f"Best model:           "
+            f"{model_output_path}"
+        )
+
+    print(
+        "Held-out test set:    "
+        "untouched"
+    )
+
+    print("=" * 60)
 
     return model, history
