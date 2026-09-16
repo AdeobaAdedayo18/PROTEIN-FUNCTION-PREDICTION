@@ -569,6 +569,7 @@ def main():
         device=args.device,
         seed=args.seed,
         model_output_path=args.model_output,
+        split_output_path="data/splits/protein_splits.json",
     )
 
     print("\nTraining complete.")
