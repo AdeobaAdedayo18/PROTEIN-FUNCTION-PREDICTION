@@ -27,9 +27,43 @@ def fmax_score(y_true: np.ndarray, y_prob: np.ndarray, thresholds=None) -> tuple
     return best_f, best_t
 
 def aupr_scores(y_true: np.ndarray, y_prob: np.ndarray) -> dict:
-    micro = average_precision_score(y_true, y_prob, average="micro")
-    macro = average_precision_score(y_true, y_prob, average="macro")
-    return {"aupr_micro": micro, "aupr_macro": macro}
+    """
+    Compute micro- and macro-averaged AUPR.
+
+    Micro-AUPR pools all protein-label pairs.
+
+    Macro-AUPR is computed only over GO terms that have at least one
+    positive example in the evaluated split. Average precision is not
+    meaningful for a label with zero positives.
+
+    The number of evaluable terms is returned for transparency.
+    """
+
+    micro = average_precision_score(
+        y_true,
+        y_prob,
+        average="micro",
+    )
+
+    positive_mask = y_true.sum(axis=0) > 0
+    n_evaluable = int(positive_mask.sum())
+    n_total = int(y_true.shape[1])
+
+    if n_evaluable == 0:
+        macro = 0.0
+    else:
+        macro = average_precision_score(
+            y_true[:, positive_mask],
+            y_prob[:, positive_mask],
+            average="macro",
+        )
+
+    return {
+        "aupr_micro": float(micro),
+        "aupr_macro": float(macro),
+        "macro_evaluable_terms": n_evaluable,
+        "macro_total_terms": n_total,
+    }
 
 def hierarchy_violation_rate(y_prob: np.ndarray, parent_child_pairs: list[tuple[int, int]]) -> float:
     """Fraction of (protein, child-parent pair) instances where child_prob > parent_prob.
@@ -42,8 +76,30 @@ def hierarchy_violation_rate(y_prob: np.ndarray, parent_child_pairs: list[tuple[
     violations = (y_prob[:, child_idx] > y_prob[:, parent_idx]).mean()
     return float(violations)
 
-def full_report(y_true: np.ndarray, y_prob: np.ndarray, parent_child_pairs: list[tuple[int, int]]) -> dict:
-    fmax, t_star = fmax_score(y_true, y_prob)
-    aupr = aupr_scores(y_true, y_prob)
-    hvr = hierarchy_violation_rate(y_prob, parent_child_pairs)
-    return {"fmax": fmax, "best_threshold": t_star, **aupr, "hierarchy_violation_rate": hvr}
+def full_report(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    parent_child_pairs: list[tuple[int, int]],
+) -> dict:
+
+    fmax, t_star = fmax_score(
+        y_true,
+        y_prob,
+    )
+
+    aupr = aupr_scores(
+        y_true,
+        y_prob,
+    )
+
+    hvr = hierarchy_violation_rate(
+        y_prob,
+        parent_child_pairs,
+    )
+
+    return {
+        "fmax": fmax,
+        "best_threshold": t_star,
+        **aupr,
+        "hierarchy_violation_rate": hvr,
+    }
