@@ -5,7 +5,28 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ldpfp"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
+
+dependencies = [
+    "numpy",
+    "pandas",
+    "polars",
+    "pyarrow",
+    "biopython",
+    "obonet",
+    "networkx",
+    "torch",
+    "transformers",
+    "scikit-learn",
+    "xgboost",
+    "lightgbm",
+    "catboost",
+    "mlflow",
+    "python-dotenv",
+    "tqdm",
+    "requests",
+    "tenacity",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
