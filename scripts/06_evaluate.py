@@ -120,6 +120,17 @@ def parse_args():
         default=5,
     )
 
+    parser.add_argument(
+    "--prediction-cache",
+    default=None,
+    help=(
+        "Optional path to cached held-out predictions. "
+        "If the file exists, model inference is skipped. "
+        "If it does not exist, predictions are generated "
+        "and saved there."
+    ),
+)
+
     return parser.parse_args()
 
 
@@ -448,7 +459,169 @@ def evaluate_matrix(
 
     "hierarchy_violation_rate": float(hvr),
     }
+def save_prediction_cache(
+    path,
+    y_true,
+    y_prob,
+    protein_ids,
+    checkpoint_path,
+    go_terms,
+):
+    """Persist expensive held-out inference results."""
 
+    path = Path(path)
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    np.savez_compressed(
+        path,
+        y_true=y_true.astype(np.float32),
+        y_prob=y_prob.astype(np.float32),
+        protein_ids=np.asarray(
+            protein_ids,
+            dtype=str,
+        ),
+        go_terms=np.asarray(
+            go_terms,
+            dtype=str,
+        ),
+        checkpoint_path=np.asarray(
+            str(checkpoint_path)
+        ),
+    )
+
+    print(
+        f"\nPrediction cache saved → {path}"
+    )
+
+
+def load_prediction_cache(
+    path,
+    expected_test_ids,
+    expected_go_terms,
+):
+    """Load and validate previously generated test predictions."""
+
+    path = Path(path)
+
+    print(
+        f"\nLoading cached test predictions → {path}"
+    )
+
+    data = np.load(
+        path,
+        allow_pickle=False,
+    )
+
+    required = {
+        "y_true",
+        "y_prob",
+        "protein_ids",
+        "go_terms",
+    }
+
+    missing = required - set(data.files)
+
+    if missing:
+        raise ValueError(
+            "Prediction cache is missing required "
+            f"fields: {sorted(missing)}"
+        )
+
+    y_true = data["y_true"]
+    y_prob = data["y_prob"]
+
+    cached_protein_ids = [
+        str(x)
+        for x in data["protein_ids"].tolist()
+    ]
+
+    cached_go_terms = [
+        str(x)
+        for x in data["go_terms"].tolist()
+    ]
+
+    expected_test_ids = [
+        str(x)
+        for x in expected_test_ids
+    ]
+
+    expected_go_terms = [
+        str(x)
+        for x in expected_go_terms
+    ]
+
+    # --------------------------------------------------------
+    # Critical integrity checks
+    # --------------------------------------------------------
+
+    if cached_protein_ids != expected_test_ids:
+        raise ValueError(
+            "Prediction cache protein IDs do not "
+            "match the current held-out test split."
+        )
+
+    if cached_go_terms != expected_go_terms:
+        raise ValueError(
+            "Prediction cache GO vocabulary/order "
+            "does not match the reconstructed vocabulary."
+        )
+
+    expected_shape = (
+        len(expected_test_ids),
+        len(expected_go_terms),
+    )
+
+    if y_true.shape != expected_shape:
+        raise ValueError(
+            "Cached target matrix has wrong shape. "
+            f"Expected {expected_shape}, "
+            f"got {y_true.shape}."
+        )
+
+    if y_prob.shape != expected_shape:
+        raise ValueError(
+            "Cached prediction matrix has wrong shape. "
+            f"Expected {expected_shape}, "
+            f"got {y_prob.shape}."
+        )
+
+    if not np.isfinite(y_true).all():
+        raise ValueError(
+            "Cached targets contain NaN or infinity."
+        )
+
+    if not np.isfinite(y_prob).all():
+        raise ValueError(
+            "Cached predictions contain NaN or infinity."
+        )
+
+    if np.any(y_prob < 0) or np.any(y_prob > 1):
+        raise ValueError(
+            "Cached prediction probabilities are "
+            "outside [0, 1]."
+        )
+
+    print("Prediction cache validated successfully.")
+
+    print(
+        f"Cached prediction matrix: "
+        f"{y_prob.shape}"
+    )
+
+    print(
+        f"Cached target matrix:     "
+        f"{y_true.shape}"
+    )
+
+    return (
+        y_true,
+        y_prob,
+        cached_protein_ids,
+    )
 
 # ============================================================
 # Main
@@ -751,106 +924,135 @@ def main():
     print("Checkpoint loaded successfully.")
 
     # --------------------------------------------------------
-    # Inference
+    # Prediction cache / inference
     # --------------------------------------------------------
 
-    print("\nRunning FINAL held-out test inference...")
-
-    all_probs = []
-    all_targets = []
-    all_protein_ids = []
+    use_cache = (
+        args.prediction_cache is not None
+        and Path(args.prediction_cache).exists()
+    )
 
     attention_records = []
 
-    with torch.no_grad():
+    if use_cache:
+        (
+            y_true,
+            y_prob,
+            all_protein_ids,
+        ) = load_prediction_cache(
+            args.prediction_cache,
+            expected_test_ids=test_ids,
+            expected_go_terms=go_terms,
+        )
 
-        for (
-            protein_ids,
-            embeddings,
-            mask,
-            targets,
-        ) in test_loader:
+        print(
+            "\nSkipping model inference because "
+            "a valid prediction cache was found."
+        )
 
-            embeddings = embeddings.to(
-                device,
-                non_blocking=True,
-            )
+    else:
+        print("\nRunning FINAL held-out test inference...")
 
-            mask = mask.to(
-                device,
-                non_blocking=True,
-            )
+        all_probs = []
+        all_targets = []
+        all_protein_ids = []
 
-            logits, alpha = model(
+        with torch.no_grad():
+            for (
+                protein_ids,
                 embeddings,
                 mask,
-            )
-
-            probs = torch.sigmoid(
-                logits
-            )
-
-            all_probs.append(
-                probs.cpu().numpy()
-            )
-
-            all_targets.append(
-                targets.numpy()
-            )
-
-            all_protein_ids.extend(
-                protein_ids
-            )
-
-            alpha = alpha.cpu().numpy()
-            batch_mask = mask.cpu().numpy()
-
-            for i, protein in enumerate(
-                protein_ids
-            ):
-                valid_count = int(
-                    batch_mask[i].sum()
+                targets,
+            ) in test_loader:
+                embeddings = embeddings.to(
+                    device,
+                    non_blocking=True,
                 )
 
-                attention_records.append(
-                    {
-                        "protein":
-                            protein,
-                        "weights":
-                            alpha[
+                mask = mask.to(
+                    device,
+                    non_blocking=True,
+                )
+
+                logits, alpha = model(
+                    embeddings,
+                    mask,
+                )
+
+                probs = torch.sigmoid(logits)
+
+                all_probs.append(
+                    probs.cpu().numpy()
+                )
+                all_targets.append(
+                    targets.numpy()
+                )
+                all_protein_ids.extend(
+                    protein_ids
+                )
+
+                alpha = alpha.cpu().numpy()
+                batch_mask = mask.cpu().numpy()
+
+                for i, protein in enumerate(protein_ids):
+                    valid_count = int(
+                        batch_mask[i].sum()
+                    )
+
+                    attention_records.append(
+                        {
+                            "protein": protein,
+                            "weights": alpha[
                                 i,
                                 :valid_count,
                             ].copy(),
-                    }
-                )
+                        }
+                    )
 
-    y_prob = np.concatenate(
-        all_probs,
-        axis=0,
-    )
-
-    y_true = np.concatenate(
-        all_targets,
-        axis=0,
-    )
-
-    print(
-        f"Prediction matrix: "
-        f"{y_prob.shape}"
-    )
-
-    print(
-        f"Target matrix:     "
-        f"{y_true.shape}"
-    )
-
-    if y_prob.shape != (
-        len(test_ids),
-        n_labels,
-    ):
-        raise ValueError(
-            "Unexpected prediction matrix shape."
+        y_prob = np.concatenate(
+            all_probs,
+            axis=0,
         )
+        y_true = np.concatenate(
+            all_targets,
+            axis=0,
+        )
+
+        print(
+            f"Prediction matrix: {y_prob.shape}"
+        )
+        print(
+            f"Target matrix:     {y_true.shape}"
+        )
+
+        expected_shape = (
+            len(test_ids),
+            n_labels,
+        )
+
+        if y_prob.shape != expected_shape:
+            raise ValueError(
+                "Unexpected prediction matrix shape. "
+                f"Expected {expected_shape}, "
+                f"got {y_prob.shape}."
+            )
+
+        if y_true.shape != expected_shape:
+            raise ValueError(
+                "Unexpected target matrix shape. "
+                f"Expected {expected_shape}, "
+                f"got {y_true.shape}."
+            )
+
+        if args.prediction_cache is not None:
+            save_prediction_cache(
+                args.prediction_cache,
+                y_true=y_true,
+                y_prob=y_prob,
+                protein_ids=all_protein_ids,
+                checkpoint_path=args.checkpoint,
+                go_terms=go_terms,
+            )
 
     # --------------------------------------------------------
     # Raw evaluation
@@ -888,12 +1090,9 @@ def main():
         args.validation_threshold,
     )
 
-    corrected_report = evaluate_matrix(
-        y_true,
-        y_prob_corrected,
-        parent_child_pairs,
-        args.validation_threshold,
-    )
+    corrected_hvr = corrected_report[
+    "hierarchy_violation_rate"
+    ]
 
     # --------------------------------------------------------
     # Category metrics
@@ -1080,133 +1279,151 @@ def main():
     print("=" * 68)
 
     for category in ["BP", "MF", "CC"]:
-
         if category not in category_reports:
             continue
 
-        report = category_reports[
-            category
-        ]
+        reports = category_reports[category]
+        raw = reports["raw"]
+        corrected = reports["corrected"]
 
+        print(f"\n{category}")
         print(
-            f"\n{category}"
-        )
-
-        print(
-            f"  Labels:       "
+            f"  Labels:               "
             f"{len(category_indices[category]):,}"
         )
-
         print(
-            f"  Fmax:         "
-            f"{report['fmax']:.6f}"
+            f"  Raw Fmax:             "
+            f"{raw['fmax']:.6f}"
         )
-
         print(
-            f"  micro-AUPR:   "
-            f"{report['aupr_micro']:.6f}"
+            f"  Corrected Fmax:       "
+            f"{corrected['fmax']:.6f}"
         )
-
         print(
-            f"  macro-AUPR:   "
-            f"{report['aupr_macro']:.6f}"
+            f"  Raw micro-AUPR:       "
+            f"{raw['aupr_micro']:.6f}"
         )
-
         print(
-            f"  macro labels: "
-            f"{report['macro_evaluable_terms']:,}"
+            f"  Corrected micro-AUPR: "
+            f"{corrected['aupr_micro']:.6f}"
         )
-
         print(
-            f"  HVR:          "
-            f"{report['hierarchy_violation_rate']:.6f}"
+            f"  Raw macro-AUPR:       "
+            f"{raw['aupr_macro']:.6f}"
+        )
+        print(
+            f"  Corrected macro-AUPR: "
+            f"{corrected['aupr_macro']:.6f}"
+        )
+        print(
+            f"  Macro labels:         "
+            f"{raw['macro_evaluable_terms']:,}"
+        )
+        print(
+            f"  HVR before:           "
+            f"{raw['hierarchy_violation_rate']:.6f}"
+        )
+        print(
+            f"  HVR after:            "
+            f"{corrected['hierarchy_violation_rate']:.6f}"
         )
 
     # --------------------------------------------------------
     # Qualitative attention examples
     # --------------------------------------------------------
 
-    print("\n")
-    print("=" * 68)
-    print("QUALITATIVE ATTENTION EXAMPLES")
-    print("=" * 68)
+    if use_cache:
+        print("\n")
+        print("=" * 68)
+        print("QUALITATIVE ATTENTION EXAMPLES")
+        print("=" * 68)
+        print(
+            "Skipped because predictions were loaded "
+            "from cache and attention weights were not cached."
+        )
+    else:
+        print("\n")
+        print("=" * 68)
+        print("QUALITATIVE ATTENTION EXAMPLES")
+        print("=" * 68)
 
-    n_examples = min(
-        args.qualitative_examples,
-        len(all_protein_ids),
-    )
+        n_examples = min(
+            args.qualitative_examples,
+            len(all_protein_ids),
+        )
 
-    for example_idx in range(
-        n_examples
-    ):
+        for example_idx in range(
+            n_examples
+        ):
 
-        protein = all_protein_ids[
-            example_idx
-        ]
-
-        probs = y_prob[
-            example_idx
-        ]
-
-        true_count = int(
-            y_true[
+            protein = all_protein_ids[
                 example_idx
-            ].sum()
-        )
-
-        top_prediction_indices = (
-            np.argsort(probs)[-10:][::-1]
-        )
-
-        print(
-            f"\nProtein: {protein}"
-        )
-
-        print(
-            f"True GO labels: {true_count}"
-        )
-
-        print("\nTop predicted GO terms:")
-
-        for idx in top_prediction_indices:
-
-            print(
-                f"  {go_terms[idx]}  "
-                f"{probs[idx]:.4f}"
-            )
-
-        # Dataset retains the same PMID ordering supplied
-        # by protein_to_pmids after unavailable embeddings
-        # are removed.
-        valid_pmids = [
-            pmid
-            for pmid in protein_to_pmids[
-                protein
             ]
-            if pmid in pmid_to_vec
-        ]
 
-        weights = attention_records[
-            example_idx
-        ]["weights"]
+            probs = y_prob[
+                example_idx
+            ]
 
-        top_attention = np.argsort(
-            weights
-        )[::-1][:10]
-
-        print("\nTop-attended PMIDs:")
-
-        for idx in top_attention:
-
-            if idx >= len(valid_pmids):
-                continue
-
-            print(
-                f"  PMID {valid_pmids[idx]}  "
-                f"alpha={weights[idx]:.4f}"
+            true_count = int(
+                y_true[
+                    example_idx
+                ].sum()
             )
 
-        print("-" * 68)
+            top_prediction_indices = (
+                np.argsort(probs)[-10:][::-1]
+            )
+
+            print(
+                f"\nProtein: {protein}"
+            )
+
+            print(
+                f"True GO labels: {true_count}"
+            )
+
+            print("\nTop predicted GO terms:")
+
+            for idx in top_prediction_indices:
+
+                print(
+                    f"  {go_terms[idx]}  "
+                    f"{probs[idx]:.4f}"
+                )
+
+            # Dataset retains the same PMID ordering supplied
+            # by protein_to_pmids after unavailable embeddings
+            # are removed.
+            valid_pmids = [
+                pmid
+                for pmid in protein_to_pmids[
+                    protein
+                ]
+                if pmid in pmid_to_vec
+            ]
+
+            weights = attention_records[
+                example_idx
+            ]["weights"]
+
+            top_attention = np.argsort(
+                weights
+            )[::-1][:10]
+
+            print("\nTop-attended PMIDs:")
+
+            for idx in top_attention:
+
+                if idx >= len(valid_pmids):
+                    continue
+
+                print(
+                    f"  PMID {valid_pmids[idx]}  "
+                    f"alpha={weights[idx]:.4f}"
+                )
+
+            print("-" * 68)
+
 
     # --------------------------------------------------------
     # Save JSON results
@@ -1284,9 +1501,9 @@ def main():
         }
     )
 
-    for category, report in (
-        category_reports.items()
-    ):
+    for category, reports in category_reports.items():
+        raw = reports["raw"]
+        corrected = reports["corrected"]
 
         rows.append(
             {
@@ -1295,17 +1512,15 @@ def main():
                 "category":
                     category,
                 "fmax":
-                    report["fmax"],
+                    raw["fmax"],
                 "aupr_micro":
-                    report["aupr_micro"],
+                    raw["aupr_micro"],
                 "aupr_macro":
-                    report["aupr_macro"],
+                    raw["aupr_macro"],
                 "hierarchy_violation_before":
-                    report[
-                        "hierarchy_violation_rate"
-                    ],
+                    raw["hierarchy_violation_rate"],
                 "hierarchy_violation_after":
-                    "",
+                    corrected["hierarchy_violation_rate"],
             }
         )
 
