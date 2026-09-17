@@ -15,56 +15,92 @@ def precision_recall_at_threshold(y_true: np.ndarray, y_prob: np.ndarray, t: flo
         return 0.0, 0.0
     return precision[covered].mean(), recall[true_pos > 0].mean()
 
-def fmax_score(y_true: np.ndarray, y_prob: np.ndarray, thresholds=None) -> tuple[float, float]:
-    """CAFA-style protein-centric Fmax: max F1 over a sweep of decision thresholds."""
-    thresholds = thresholds or np.arange(0.01, 1.00, 0.01)
-    best_f, best_t = 0.0, 0.0
-    for t in thresholds:
-        p, r = precision_recall_at_threshold(y_true, y_prob, t)
-        f = 0.0 if (p + r) == 0 else 2 * p * r / (p + r)
-        if f > best_f:
-            best_f, best_t = f, t
-    return best_f, best_t
+def fmax_score(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    thresholds=None,
+) -> tuple[float, float]:
+    """CAFA-style protein-centric Fmax."""
 
-def aupr_scores(y_true: np.ndarray, y_prob: np.ndarray) -> dict:
+    if thresholds is None:
+        thresholds = np.arange(0.01, 1.00, 0.01)
+
+    best_f, best_t = 0.0, 0.0
+
+    for t in thresholds:
+        p, r = precision_recall_at_threshold(
+            y_true,
+            y_prob,
+            t,
+        )
+
+        f = (
+            0.0
+            if (p + r) == 0
+            else 2 * p * r / (p + r)
+        )
+
+        if f > best_f:
+            best_f = f
+            best_t = float(t)
+
+    return float(best_f), float(best_t)
+
+
+def aupr_scores(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+) -> dict:
     """
     Compute micro- and macro-averaged AUPR.
 
-    Micro-AUPR pools all protein-label pairs.
+    Micro-AUPR pools all protein-label prediction pairs.
 
-    Macro-AUPR is computed only over GO terms that have at least one
-    positive example in the evaluated split. Average precision is not
-    meaningful for a label with zero positives.
-
-    The number of evaluable terms is returned for transparency.
+    Macro-AUPR is calculated only over GO terms that contain at least
+    one positive example in the evaluated split. Terms with zero
+    positives cannot have a meaningful per-label precision-recall
+    curve and are therefore excluded from the macro average.
     """
 
+    # ---------------------------------------------------------
+    # Micro-AUPR
+    # ---------------------------------------------------------
     micro = average_precision_score(
         y_true,
         y_prob,
         average="micro",
     )
 
+    # ---------------------------------------------------------
+    # Macro-AUPR
+    # ---------------------------------------------------------
+    # A GO term is evaluable only if it has at least one
+    # positive example in this evaluation split.
     positive_mask = y_true.sum(axis=0) > 0
-    n_evaluable = int(positive_mask.sum())
-    n_total = int(y_true.shape[1])
 
-    if n_evaluable == 0:
+    n_evaluable_terms = int(positive_mask.sum())
+    n_total_terms = int(y_true.shape[1])
+
+    if n_evaluable_terms == 0:
         macro = 0.0
+
     else:
-        macro = average_precision_score(
+        per_label_ap = average_precision_score(
             y_true[:, positive_mask],
             y_prob[:, positive_mask],
-            average="macro",
+            average=None,
+        )
+
+        macro = float(
+            np.mean(per_label_ap)
         )
 
     return {
         "aupr_micro": float(micro),
-        "aupr_macro": float(macro),
-        "macro_evaluable_terms": n_evaluable,
-        "macro_total_terms": n_total,
+        "aupr_macro": macro,
+        "macro_evaluable_terms": n_evaluable_terms,
+        "macro_total_terms": n_total_terms,
     }
-
 def hierarchy_violation_rate(y_prob: np.ndarray, parent_child_pairs: list[tuple[int, int]]) -> float:
     """Fraction of (protein, child-parent pair) instances where child_prob > parent_prob.
     Reported before AND after the post-hoc consistency pass (Section 3.6) to quantify
