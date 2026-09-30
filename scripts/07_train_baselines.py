@@ -874,6 +874,23 @@ def main():
             f"{len(label_indices):,} labels..."
         )
         times = []
+        benchmark_records = []
+
+        def frequency_bin(positive_count: int) -> str:
+            if positive_count == 1:
+                return "1"
+            if 2 <= positive_count <= 5:
+                return "2-5"
+            if 6 <= positive_count <= 10:
+                return "6-10"
+            if 11 <= positive_count <= 50:
+                return "11-50"
+            if 51 <= positive_count <= 100:
+                return "51-100"
+            if positive_count > 100:
+                return ">100"
+            return "0"
+
         for number, label_idx in enumerate(
             label_indices,
             start=1,
@@ -898,6 +915,13 @@ def main():
                 - start
             )
             times.append(elapsed)
+            train_positive_count = int(positive_counts[label_idx])
+            benchmark_records.append(
+                {
+                    "bin": frequency_bin(train_positive_count),
+                    "seconds": float(elapsed),
+                }
+            )
             print(
                 f"[{number:>3}/"
                 f"{len(label_indices)}] "
@@ -918,6 +942,46 @@ def main():
             mean_seconds
             * trainable
         )
+
+        bin_masks = {
+            "1": positive_counts == 1,
+            "2-5": (positive_counts >= 2) & (positive_counts <= 5),
+            "6-10": (positive_counts >= 6) & (positive_counts <= 10),
+            "11-50": (positive_counts >= 11) & (positive_counts <= 50),
+            "51-100": (positive_counts >= 51) & (positive_counts <= 100),
+            ">100": positive_counts > 100,
+        }
+
+        weighted_estimated_seconds = 0.0
+        weighted_rows = []
+
+        for bin_name, mask in bin_masks.items():
+            actual_count = int(mask.sum())
+            sampled_times = [
+                record["seconds"]
+                for record in benchmark_records
+                if record["bin"] == bin_name
+            ]
+
+            if not sampled_times:
+                raise RuntimeError(
+                    f"No benchmark timings collected for frequency bin {bin_name}."
+                )
+
+            bin_mean_seconds = float(np.mean(sampled_times))
+            bin_estimated_seconds = bin_mean_seconds * actual_count
+            weighted_estimated_seconds += bin_estimated_seconds
+
+            weighted_rows.append(
+                (
+                    bin_name,
+                    actual_count,
+                    len(sampled_times),
+                    bin_mean_seconds,
+                    bin_estimated_seconds,
+                )
+            )
+
         print("\n" + "=" * 68)
         print("BENCHMARK SUMMARY")
         print("=" * 68)
@@ -944,6 +1008,39 @@ def main():
         print(
             f"Naive full-run estimate:"
             f" {estimated_seconds / 3600:.2f} hours"
+        )
+
+        print("\nFrequency-weighted estimate:")
+        print(
+            f"{'Bin':<10}"
+            f"{'Labels':>10}"
+            f"{'Sampled':>10}"
+            f"{'Mean s':>12}"
+            f"{'Est. hours':>14}"
+        )
+
+        for (
+            bin_name,
+            actual_count,
+            sampled_count,
+            bin_mean_seconds,
+            bin_estimated_seconds,
+        ) in weighted_rows:
+            print(
+                f"{bin_name:<10}"
+                f"{actual_count:>10,}"
+                f"{sampled_count:>10,}"
+                f"{bin_mean_seconds:>12.2f}"
+                f"{bin_estimated_seconds / 3600:>14.2f}"
+            )
+
+        print(
+            f"\nWeighted full-run estimate:"
+            f" {weighted_estimated_seconds / 3600:.2f} hours"
+        )
+        print(
+            "Note: this is still an estimate from the sampled labels; "
+            "checkpoint I/O and runtime variation are not included."
         )
         print("=" * 68)
         return
