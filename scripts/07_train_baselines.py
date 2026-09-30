@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 import numpy as np
 import polars as pl
+import lightgbm as lgb
 from ldpfp.evaluate import (
     aupr_scores,
     fmax_score,
