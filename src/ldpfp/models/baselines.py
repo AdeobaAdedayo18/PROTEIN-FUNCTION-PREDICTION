@@ -20,15 +20,27 @@ BASELINE_NAMES = (
     "random_forest",
 )
 
+ACCELERATORS = ("cpu", "cuda")
+
 
 def build_baseline(
     name: str,
     n_jobs: int = -1,
     random_state: int = 42,
+    accelerator: str = "cpu",
 ):
-    """Construct one binary baseline classifier."""
+    """Construct one binary baseline classifier.
 
+    accelerator="cuda" enables GPU training for XGBoost and CatBoost.
+    LightGBM and Random Forest remain on CPU in this project pipeline.
+    """
     name = name.lower().strip()
+    accelerator = accelerator.lower().strip()
+
+    if accelerator not in ACCELERATORS:
+        raise ValueError(
+            f"Unknown accelerator {accelerator!r}. Expected one of {ACCELERATORS}."
+        )
 
     if name == "xgboost":
         return XGBClassifier(
@@ -36,12 +48,18 @@ def build_baseline(
             max_depth=6,
             learning_rate=0.1,
             tree_method="hist",
+            device="cuda" if accelerator == "cuda" else "cpu",
             n_jobs=n_jobs,
             eval_metric="logloss",
             random_state=random_state,
         )
 
     if name == "lightgbm":
+        if accelerator == "cuda":
+            raise ValueError(
+                "CUDA mode is not enabled for the LightGBM baseline in this pipeline. "
+                "Use --accelerator cpu."
+            )
         return LGBMClassifier(
             n_estimators=300,
             num_leaves=31,
@@ -52,7 +70,7 @@ def build_baseline(
         )
 
     if name == "catboost":
-        return CatBoostClassifier(
+        kwargs = dict(
             iterations=300,
             depth=6,
             learning_rate=0.1,
@@ -60,9 +78,20 @@ def build_baseline(
             allow_writing_files=False,
             random_seed=random_state,
             thread_count=n_jobs,
+            loss_function="Logloss",
         )
+        if accelerator == "cuda":
+            kwargs.update(task_type="GPU", devices="0")
+        else:
+            kwargs.update(task_type="CPU")
+        return CatBoostClassifier(**kwargs)
 
     if name == "random_forest":
+        if accelerator == "cuda":
+            raise ValueError(
+                "scikit-learn RandomForestClassifier is CPU-only in this pipeline. "
+                "Use --accelerator cpu."
+            )
         return RandomForestClassifier(
             n_estimators=300,
             max_depth=None,
@@ -71,6 +100,5 @@ def build_baseline(
         )
 
     raise ValueError(
-        f"Unknown baseline {name!r}. "
-        f"Expected one of {BASELINE_NAMES}."
+        f"Unknown baseline {name!r}. Expected one of {BASELINE_NAMES}."
     )

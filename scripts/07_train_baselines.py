@@ -220,7 +220,23 @@ def parse_args():
 
         "--feature-cache-dir", default=None,
 
-        help="Cache mean-pooled train/validation/test features here. Defaults to \<output-dir>/feature_cache.",
+        help="Cache mean-pooled train/validation/test features here. Defaults to <output-dir>/feature_cache.",
+
+    )
+
+    parser.add_argument(
+
+        "--accelerator",
+
+        choices=("cpu", "cuda"),
+
+        default="cpu",
+
+        help=(
+            "Training device for supported baselines. "
+            "CUDA is supported for XGBoost and CatBoost; "
+            "LightGBM and Random Forest use CPU in this pipeline."
+        ),
 
     )
 
@@ -709,6 +725,20 @@ def fit_binary_baseline(model_name, model, X_train, y_train, X_val, y_val, early
             # XGBoost stores a zero-based boosting-round index.
             return int(best_iteration) + 1
 
+        return None
+
+    if model_name == "catboost":
+        model.fit(
+            X_train,
+            y_train,
+            eval_set=(X_val, y_val),
+            early_stopping_rounds=early_stopping_rounds,
+            use_best_model=True,
+            verbose=False,
+        )
+        best_iteration = model.get_best_iteration()
+        if best_iteration is not None and int(best_iteration) >= 0:
+            return int(best_iteration) + 1
         return None
 
     model.fit(X_train, y_train)
@@ -1380,6 +1410,10 @@ def main():
 
     )
 
+    # Preserve legacy CPU filenames so existing CPU checkpoints resume unchanged.
+    # CUDA runs get isolated checkpoint/result names and cannot collide with CPU runs.
+    run_key = args.model if args.accelerator == "cpu" else f"{args.model}_cuda"
+
     print("=" * 68)
 
     print("PHASE 7B — BASELINE TRAINING")
@@ -1391,6 +1425,7 @@ def main():
         f"Model: {args.model}"
 
     )
+    print(f"Accelerator: {args.accelerator}")
 
     # --------------------------------------------------------
 
@@ -1819,6 +1854,7 @@ def main():
                 n_jobs=args.n_jobs,
 
                 random_state=args.seed,
+                accelerator=args.accelerator,
 
             )
 
@@ -2112,7 +2148,7 @@ def main():
 
         output_dir,
 
-        args.model,
+        run_key,
 
         go_terms,
 
@@ -2249,6 +2285,7 @@ def main():
                     n_jobs=args.n_jobs,
 
                     random_state=args.seed,
+                    accelerator=args.accelerator,
 
                 )
 
@@ -2332,7 +2369,7 @@ def main():
 
                 output_dir,
 
-                args.model,
+                run_key,
 
                 predictions,
 
@@ -2350,7 +2387,7 @@ def main():
 
         output_dir,
 
-        args.model,
+        run_key,
 
         predictions,
 
@@ -2382,7 +2419,7 @@ def main():
 
         output_dir
 
-        / f"{args.model}_test_predictions.npz"
+        / f"{run_key}_test_predictions.npz"
 
     )
 
@@ -2858,7 +2895,7 @@ def main():
 
         output_dir
 
-        / f"{args.model}_metrics.json"
+        / f"{run_key}_metrics.json"
 
     )
 
@@ -2892,7 +2929,7 @@ def main():
 
         output_dir
 
-        / f"{args.model}_metrics.csv"
+        / f"{run_key}_metrics.csv"
 
     )
 
