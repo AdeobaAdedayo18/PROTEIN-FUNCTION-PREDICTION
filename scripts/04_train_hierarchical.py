@@ -85,6 +85,13 @@ def parse_args():
     )
 
     parser.add_argument(
+    "--pooling",
+    choices=["attention", "mean", "max"],
+    default="attention",
+    help="Protein-level PMID pooling strategy.",
+    )
+
+    parser.add_argument(
         "--device",
         default=None,
     )
@@ -570,6 +577,7 @@ def main():
         seed=args.seed,
         model_output_path=args.model_output,
         split_output_path="data/splits/protein_splits.json",
+        pooling=args.pooling,
     )
 
     print("\nTraining complete.")

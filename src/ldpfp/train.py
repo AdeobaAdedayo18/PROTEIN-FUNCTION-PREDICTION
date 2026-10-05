@@ -198,6 +198,7 @@ def train(
     split_output_path: str | Path | None = None,
     patience: int = 5,
     min_delta: float = 1e-4,
+    pooling: str = "attention",
 ):
     """
     Train the hierarchical GO classifier.
@@ -300,6 +301,7 @@ def train(
     print(f"Epochs: {epochs}")
     print(f"Patience: {patience}")
     print(f"Min delta: {min_delta}")
+    print(f"Pooling strategy: {pooling}")
 
     # ---------------------------------------------------------
     # Validation
@@ -414,8 +416,9 @@ def train(
     # ---------------------------------------------------------
 
     model = HierarchicalGOClassifier(
-        embed_dim=embed_dim,
-        n_labels=n_labels,
+    embed_dim=embed_dim,
+    n_labels=n_labels,
+    pooling=pooling,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -459,6 +462,7 @@ def train(
                 "batch_size": batch_size,
                 "lr": lr,
                 "lambda": lam,
+                "pooling": pooling,
                 "train_fraction":
                     train_fraction,
                 "val_fraction":
@@ -768,6 +772,7 @@ def train(
 
                             "embed_dim":
                                 embed_dim,
+                            "pooling": pooling,
 
                             "parent_child_pairs":
                                 parent_child_pairs,

@@ -12,25 +12,48 @@ class HierarchicalGOClassifier(nn.Module):
     """
     Multi-label GO classifier operating on publication embeddings.
 
-    PMIDAttention first combines the variable number of publication
-    embeddings belonging to each protein into a single protein
-    representation R(p_i). The classifier then predicts one logit
-    for every GO term in the vocabulary.
+    Supported protein-level pooling strategies:
+        - attention: learned PMID attention (proposed model)
+        - mean: masked mean pooling
+        - max: masked max pooling
+
+    All pooling strategies produce the same (batch, embed_dim)
+    protein representation so that the downstream classifier remains
+    identical across ablation experiments.
     """
+
+    VALID_POOLING = {"attention", "mean", "max"}
 
     def __init__(
         self,
         embed_dim: int = 768,
         hidden_dim: int = 512,
         n_labels: int = 17707,
+        pooling: str = "attention",
     ):
         super().__init__()
 
-        self.attention = PMIDAttention(
-            embed_dim=embed_dim,
-            hidden_dim=256,
-        )
+        pooling = pooling.lower().strip()
 
+        if pooling not in self.VALID_POOLING:
+            raise ValueError(
+                f"Unknown pooling strategy {pooling!r}. "
+                f"Expected one of {sorted(self.VALID_POOLING)}."
+            )
+
+        self.pooling = pooling
+
+        # Only the proposed model needs learned attention parameters.
+        if pooling == "attention":
+            self.attention = PMIDAttention(
+                embed_dim=embed_dim,
+                hidden_dim=256,
+            )
+        else:
+            self.attention = None
+
+        # IMPORTANT:
+        # Keep this classifier identical across all ablations.
         self.classifier = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
             nn.ReLU(),
@@ -38,20 +61,88 @@ class HierarchicalGOClassifier(nn.Module):
             nn.Linear(hidden_dim, n_labels),
         )
 
+    def _mean_pool(
+        self,
+        doc_embeddings: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+
+        mask_f = mask.unsqueeze(-1).to(
+            dtype=doc_embeddings.dtype
+        )
+
+        summed = (
+            doc_embeddings * mask_f
+        ).sum(dim=1)
+
+        counts = mask_f.sum(dim=1).clamp_min(1.0)
+
+        return summed / counts
+
+    def _max_pool(
+        self,
+        doc_embeddings: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+
+        masked_embeddings = doc_embeddings.masked_fill(
+            ~mask.unsqueeze(-1),
+            float("-inf"),
+        )
+
+        pooled = masked_embeddings.max(dim=1).values
+
+        # Safety guard in case a sample somehow contains no
+        # valid publication embeddings.
+        pooled = torch.where(
+            torch.isfinite(pooled),
+            pooled,
+            torch.zeros_like(pooled),
+        )
+
+        return pooled
+
     def forward(
         self,
         doc_embeddings: torch.Tensor,
         mask: torch.Tensor,
     ):
-        # R: (batch, embed_dim)
-        # alpha: (batch, k_max)
-        R, alpha = self.attention(doc_embeddings, mask)
 
-        # logits: (batch, n_labels)
+        if self.pooling == "attention":
+
+            R, alpha = self.attention(
+                doc_embeddings,
+                mask,
+            )
+
+        elif self.pooling == "mean":
+
+            R = self._mean_pool(
+                doc_embeddings,
+                mask,
+            )
+
+            # No learned attention weights exist for this ablation.
+            alpha = None
+
+        elif self.pooling == "max":
+
+            R = self._max_pool(
+                doc_embeddings,
+                mask,
+            )
+
+            alpha = None
+
+        else:
+            # Defensive guard. __init__ already validates this.
+            raise RuntimeError(
+                f"Unsupported pooling strategy: {self.pooling}"
+            )
+
         logits = self.classifier(R)
 
         return logits, alpha
-
 
 def hierarchical_loss(
     logits: torch.Tensor,
