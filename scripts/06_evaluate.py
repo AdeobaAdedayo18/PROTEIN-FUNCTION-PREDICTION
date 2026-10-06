@@ -129,7 +129,21 @@ def parse_args():
         "If it does not exist, predictions are generated "
         "and saved there."
     ),
-)
+    )
+    parser.add_argument(
+            "--pooling",
+            choices=["attention", "mean", "max"],
+            default="attention",
+            help="Protein-level PMID pooling strategy used by the checkpoint.",
+        )
+
+    parser.add_argument(
+        "--model-name",
+        default="Hierarchical Attention Classifier",
+        help="Human-readable model/ablation name for saved results.",
+    )
+
+    
 
     return parser.parse_args()
 
@@ -913,6 +927,7 @@ def main():
     model = HierarchicalGOClassifier(
         embed_dim=embed_dim,
         n_labels=n_labels,
+        pooling=args.pooling,
     ).to(device)
 
     model.load_state_dict(
@@ -991,23 +1006,24 @@ def main():
                     protein_ids
                 )
 
-                alpha = alpha.cpu().numpy()
-                batch_mask = mask.cpu().numpy()
+                if alpha is not None:
+                    alpha = alpha.cpu().numpy()
+                    batch_mask = mask.cpu().numpy()
 
-                for i, protein in enumerate(protein_ids):
-                    valid_count = int(
-                        batch_mask[i].sum()
-                    )
+                    for i, protein in enumerate(protein_ids):
+                        valid_count = int(
+                            batch_mask[i].sum()
+                        )
 
-                    attention_records.append(
-                        {
-                            "protein": protein,
-                            "weights": alpha[
-                                i,
-                                :valid_count,
-                            ].copy(),
-                        }
-                    )
+                        attention_records.append(
+                            {
+                                "protein": protein,
+                                "weights": alpha[
+                                    i,
+                                    :valid_count,
+                                ].copy(),
+                            }
+                        )
 
         y_prob = np.concatenate(
             all_probs,
@@ -1332,7 +1348,17 @@ def main():
     # Qualitative attention examples
     # --------------------------------------------------------
 
-    if use_cache:
+    if args.pooling != "attention":
+        print("\n")
+        print("=" * 68)
+        print("QUALITATIVE ATTENTION EXAMPLES")
+        print("=" * 68)
+        print(
+            f"Skipped: pooling strategy is "
+            f"{args.pooling!r}; no attention weights exist."
+        )
+
+    elif use_cache:
         print("\n")
         print("=" * 68)
         print("QUALITATIVE ATTENTION EXAMPLES")
@@ -1341,11 +1367,14 @@ def main():
             "Skipped because predictions were loaded "
             "from cache and attention weights were not cached."
         )
+
     else:
         print("\n")
         print("=" * 68)
         print("QUALITATIVE ATTENTION EXAMPLES")
         print("=" * 68)
+
+    # KEEP your existing n_examples / for-loop code here
 
         n_examples = min(
             args.qualitative_examples,
@@ -1431,7 +1460,7 @@ def main():
 
     final_results = {
         "model":
-            "Hierarchical Attention Classifier",
+            args.model_name,
         "checkpoint":
             str(args.checkpoint),
         "split":
@@ -1453,8 +1482,8 @@ def main():
     }
 
     json_path = (
-        output_dir
-        / "hierarchical_attention_test_metrics.json"
+    output_dir
+    / "test_metrics.json"
     )
 
     with open(
@@ -1483,7 +1512,7 @@ def main():
     rows.append(
         {
             "model":
-                "Hierarchical Attention Classifier",
+                args.model_name,
             "category":
                 "Overall",
             "fmax":
@@ -1508,7 +1537,7 @@ def main():
         rows.append(
             {
                 "model":
-                    "Hierarchical Attention Classifier",
+                    args.model_name,
                 "category":
                     category,
                 "fmax":
